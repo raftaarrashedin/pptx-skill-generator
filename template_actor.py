@@ -59,6 +59,11 @@ def package_exists(package_dir: str) -> bool:
     )
 
 
+def package_has_svgs(package_dir: str) -> bool:
+    svg_dir = package_svgs_dir(package_dir)
+    return os.path.isdir(svg_dir) and any(name.lower().endswith(".svg") for name in os.listdir(svg_dir))
+
+
 def reset_package_dir(package_dir: str) -> None:
     if os.path.isdir(package_dir):
         shutil.rmtree(package_dir)
