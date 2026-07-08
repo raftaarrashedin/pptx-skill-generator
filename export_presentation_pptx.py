@@ -19,6 +19,7 @@ Usage:
 
 import argparse
 import glob
+import json
 import os
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -27,6 +28,7 @@ from pptx import Presentation
 from pptx.chart.data import CategoryChartData
 from pptx.dml.color import RGBColor
 from pptx.enum.chart import XL_CHART_TYPE
+from pptx.enum.shapes import PP_PLACEHOLDER
 from pptx.enum.text import PP_ALIGN
 from pptx.util import Emu, Pt
 
@@ -71,6 +73,242 @@ def _select_layout(prs):
         if "blank" in (layout.name or "").lower():
             return layout
     return prs.slide_layouts[6] if len(prs.slide_layouts) > 6 else prs.slide_layouts[-1]
+
+
+def _find_layout_by_name(prs, *names):
+    wanted = {name.lower() for name in names}
+    for layout in prs.slide_layouts:
+        if (layout.name or "").lower() in wanted:
+            return layout
+    return None
+
+
+def _template_can_drive_layouts(prs):
+    useful = {"title", "section_header", "title_and_body", "title_and_two_columns"}
+    return any((layout.name or "").lower() in useful for layout in prs.slide_layouts)
+
+
+def _remove_shape(shape):
+    shape._element.getparent().remove(shape._element)
+
+
+def _placeholder_idx(shape):
+    if not getattr(shape, "is_placeholder", False):
+        return None
+    return shape.placeholder_format.idx
+
+
+def _find_placeholder(slide, placeholder_type=None, idx=None):
+    for shape in slide.placeholders:
+        if idx is not None and shape.placeholder_format.idx != idx:
+            continue
+        if placeholder_type is not None and shape.placeholder_format.type != placeholder_type:
+            continue
+        return shape
+    return None
+
+
+def _find_all_placeholders(slide, placeholder_type=None):
+    found = []
+    for shape in slide.placeholders:
+        if placeholder_type is not None and shape.placeholder_format.type != placeholder_type:
+            continue
+        found.append(shape)
+    return found
+
+
+def _set_text(shape, text):
+    if shape is None or not getattr(shape, "has_text_frame", False):
+        return
+    tf = shape.text_frame
+    tf.clear()
+    p = tf.paragraphs[0]
+    p.text = text or ""
+
+
+def _set_bullets(shape, bullets):
+    if shape is None or not getattr(shape, "has_text_frame", False):
+        return
+    tf = shape.text_frame
+    tf.clear()
+    items = bullets or [""]
+    for i, bullet in enumerate(items):
+        p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+        p.text = bullet
+        p.level = 0
+
+
+def _set_lines(shape, lines):
+    if shape is None or not getattr(shape, "has_text_frame", False):
+        return
+    tf = shape.text_frame
+    tf.clear()
+    items = lines or [""]
+    for i, line in enumerate(items):
+        p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+        p.text = line
+        p.level = 0
+
+
+def _body_geometry(shape, prs):
+    if shape is None:
+        margin = Emu(int(0.8 * 914400))
+        return margin, margin * 2, prs.slide_width - margin * 2, prs.slide_height - margin * 3
+    return shape.left, shape.top, shape.width, shape.height
+
+
+def _cleanup_unused_placeholders(slide, used_idxs):
+    removable_types = {
+        PP_PLACEHOLDER.BODY,
+        PP_PLACEHOLDER.PICTURE,
+        PP_PLACEHOLDER.SUBTITLE,
+        PP_PLACEHOLDER.OBJECT,
+    }
+    for shape in list(slide.placeholders):
+        idx = shape.placeholder_format.idx
+        ptype = shape.placeholder_format.type
+        if idx in used_idxs:
+            continue
+        if ptype in removable_types:
+            _remove_shape(shape)
+
+
+def _slide_layout_for_type(prs, slide_type):
+    mapping = {
+        "title": ("title", "title_only"),
+        "section": ("section_header", "section_title_and_description", "main_point"),
+        "bullets": ("title_and_body", "title_and_two_columns", "caption_only"),
+        "metrics": ("title_and_two_columns", "title_and_body", "main_point"),
+        "comparison": ("title_and_two_columns", "title_and_body"),
+        "chart": ("title_and_body", "title_and_two_columns"),
+        "image_text": ("title_and_two_columns", "title_and_body", "title_only"),
+    }
+    names = mapping.get(slide_type, ("title_and_body", "blank"))
+    return _find_layout_by_name(prs, *names) or _select_layout(prs)
+
+
+def _add_chart_in_box(slide, chart, left, top, width, height):
+    chart = chart or {"categories": [], "series": []}
+    chart_data = CategoryChartData()
+    chart_data.categories = chart.get("categories", [])
+    for series in chart.get("series", []):
+        chart_data.add_series(series.get("name", "Series"), series.get("values", []))
+    slide.shapes.add_chart(
+        XL_CHART_TYPE.COLUMN_CLUSTERED,
+        left,
+        top,
+        width,
+        height,
+        chart_data,
+    )
+
+
+def _add_image_in_box(slide, image_spec, output_dir, left, top, width, height):
+    image_spec = image_spec or {}
+    path = image_spec.get("path") or ""
+    full_path = os.path.join(output_dir, path) if path else None
+    if full_path and os.path.exists(full_path):
+        slide.shapes.add_picture(full_path, left, top, width, height)
+        return True
+    return False
+
+
+def _populate_template_slide(slide, prs, draft_slide, output_dir):
+    used_idxs = set()
+
+    title_shape = _find_placeholder(slide, idx=0) or _find_placeholder(slide, PP_PLACEHOLDER.TITLE)
+    if title_shape is not None:
+        _set_text(title_shape, draft_slide.get("title") or "")
+        used_idxs.add(_placeholder_idx(title_shape))
+
+    subtitle_text = draft_slide.get("subtitle") or ""
+    subtitle_shape = _find_placeholder(slide, PP_PLACEHOLDER.SUBTITLE)
+    body_shapes = _find_all_placeholders(slide, PP_PLACEHOLDER.BODY)
+    picture_shapes = _find_all_placeholders(slide, PP_PLACEHOLDER.PICTURE)
+
+    slide_type = draft_slide.get("type")
+    if slide_type == "title":
+        if subtitle_shape is not None:
+            _set_text(subtitle_shape, subtitle_text)
+            used_idxs.add(_placeholder_idx(subtitle_shape))
+
+    elif slide_type == "section":
+        if subtitle_shape is not None and subtitle_text:
+            _set_text(subtitle_shape, subtitle_text)
+            used_idxs.add(_placeholder_idx(subtitle_shape))
+        elif body_shapes and subtitle_text:
+            _set_text(body_shapes[0], subtitle_text)
+            used_idxs.add(_placeholder_idx(body_shapes[0]))
+
+    elif slide_type == "bullets":
+        target = body_shapes[0] if body_shapes else subtitle_shape
+        _set_bullets(target, draft_slide.get("bullets", []))
+        if target is not None:
+            used_idxs.add(_placeholder_idx(target))
+
+    elif slide_type == "metrics":
+        metrics = draft_slide.get("metrics", [])
+        metric_lines = [f"{item.get('label', '')}: {item.get('value', '')}" for item in metrics]
+        if len(body_shapes) >= 2:
+            midpoint = max(1, (len(metric_lines) + 1) // 2)
+            _set_lines(body_shapes[0], metric_lines[:midpoint])
+            _set_lines(body_shapes[1], metric_lines[midpoint:])
+            used_idxs.add(_placeholder_idx(body_shapes[0]))
+            used_idxs.add(_placeholder_idx(body_shapes[1]))
+        else:
+            target = body_shapes[0] if body_shapes else subtitle_shape
+            _set_lines(target, metric_lines)
+            if target is not None:
+                used_idxs.add(_placeholder_idx(target))
+
+    elif slide_type == "comparison":
+        comp = draft_slide.get("comparison") or {}
+        left = comp.get("left") or {}
+        right = comp.get("right") or {}
+        left_lines = [left.get("heading", "")] + [f"- {item}" for item in left.get("items", [])]
+        right_lines = [right.get("heading", "")] + [f"- {item}" for item in right.get("items", [])]
+        if len(body_shapes) >= 2:
+            _set_lines(body_shapes[0], left_lines)
+            _set_lines(body_shapes[1], right_lines)
+            used_idxs.add(_placeholder_idx(body_shapes[0]))
+            used_idxs.add(_placeholder_idx(body_shapes[1]))
+        else:
+            target = body_shapes[0] if body_shapes else subtitle_shape
+            _set_lines(target, left_lines + [""] + right_lines)
+            if target is not None:
+                used_idxs.add(_placeholder_idx(target))
+
+    elif slide_type == "chart":
+        body_shape = body_shapes[0] if body_shapes else None
+        left, top, width, height = _body_geometry(body_shape, prs)
+        if body_shape is not None:
+            _remove_shape(body_shape)
+        _add_chart_in_box(slide, draft_slide.get("chart"), left, top, width, height)
+
+    elif slide_type == "image_text":
+        bullets_target = body_shapes[0] if body_shapes else subtitle_shape
+        _set_bullets(bullets_target, draft_slide.get("bullets", []))
+        if bullets_target is not None:
+            used_idxs.add(_placeholder_idx(bullets_target))
+
+        picture_target = picture_shapes[0] if picture_shapes else None
+        if picture_target is not None:
+            used_idxs.add(_placeholder_idx(picture_target))
+            left, top, width, height = _body_geometry(picture_target, prs)
+            _remove_shape(picture_target)
+            _add_image_in_box(slide, draft_slide.get("image"), output_dir, left, top, width, height)
+
+    if draft_slide.get("notes"):
+        slide.notes_slide.notes_text_frame.text = draft_slide["notes"]
+
+    _cleanup_unused_placeholders(slide, {idx for idx in used_idxs if idx is not None})
+
+
+def build_template_slide(prs, draft_slide, output_dir):
+    layout = _slide_layout_for_type(prs, draft_slide.get("type"))
+    slide = prs.slides.add_slide(layout)
+    _populate_template_slide(slide, prs, draft_slide, output_dir)
+    return slide
 
 
 def add_textbox(slide, elem, width_px, height_px):
@@ -244,7 +482,7 @@ def build_slide(prs, svg_path, output_dir):
     return slide
 
 
-def export(output_dir: str, template_context: dict) -> str:
+def export_from_svg(output_dir: str, template_context: dict) -> str:
     width_in = template_context.get("slide_width_in", 13.333)
     height_in = template_context.get("slide_height_in", 7.5)
 
@@ -272,6 +510,33 @@ def export(output_dir: str, template_context: dict) -> str:
     return out_path
 
 
+def export_from_template(output_dir: str, template_context: dict, final_draft: dict) -> str:
+    source_template_path = template_context.get("source_template_path")
+    prs = Presentation(source_template_path)
+    _remove_all_slides(prs)
+
+    width_in = template_context.get("slide_width_in", 13.333)
+    height_in = template_context.get("slide_height_in", 7.5)
+    prs.slide_width = Emu(int(width_in * 914400))
+    prs.slide_height = Emu(int(height_in * 914400))
+
+    for draft_slide in final_draft.get("slides", []):
+        build_template_slide(prs, draft_slide, output_dir)
+
+    out_path = os.path.join(output_dir, "final_presentation.pptx")
+    prs.save(out_path)
+    return out_path
+
+
+def export(output_dir: str, template_context: dict, final_draft: dict | None = None) -> str:
+    source_template_path = template_context.get("source_template_path")
+    if source_template_path and os.path.exists(source_template_path):
+        prs = Presentation(source_template_path)
+        if final_draft and _template_can_drive_layouts(prs):
+            return export_from_template(output_dir, template_context, final_draft)
+    return export_from_svg(output_dir, template_context)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Export rendered SVG slides to an editable pptx."
@@ -287,18 +552,21 @@ def main():
         log(args.output_dir, f"ERROR: missing input {ctx_path}")
         raise SystemExit(f"Missing input: {ctx_path}")
 
-    import json
-
     with open(ctx_path, encoding="utf-8") as f:
         template_context = json.load(f)
+    final_draft = None
+    final_path = os.path.join(args.output_dir, "presentation_final.json")
+    if os.path.exists(final_path):
+        with open(final_path, encoding="utf-8") as f:
+            final_draft = json.load(f)
 
     log(
         args.output_dir,
-        f"input file used: {os.path.join(args.output_dir, 'slides_svg')}, {ctx_path}",
+        f"input file used: {os.path.join(args.output_dir, 'slides_svg')}, {ctx_path}, {final_path}",
     )
 
     try:
-        out_path = export(args.output_dir, template_context)
+        out_path = export(args.output_dir, template_context, final_draft=final_draft)
     except Exception as e:
         log(args.output_dir, f"ERROR: {e}")
         raise
