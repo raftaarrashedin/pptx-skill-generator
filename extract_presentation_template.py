@@ -20,6 +20,7 @@ from template_actor import (
     package_context_path,
     package_dir_for_template,
     package_exists,
+    package_has_svgs,
     package_source_pptx_path,
     package_svgs_dir,
     reset_package_dir,
@@ -27,6 +28,7 @@ from template_actor import (
 )
 from template_catalog import resolve_template_reference, template_name_from_path
 from template_context_builder import build_context
+from template_svg_extractor import extract_template_svgs
 
 
 def extract_template_package(
@@ -35,7 +37,7 @@ def extract_template_package(
     template_path = resolve_template_reference(template_reference)
     package_dir = package_dir_for_template(template_path)
 
-    if package_exists(package_dir) and not force:
+    if package_exists(package_dir) and package_has_svgs(package_dir) and not force:
         with open(package_context_path(package_dir), encoding="utf-8") as f:
             return package_dir, json.load(f), True
 
@@ -55,6 +57,8 @@ def extract_template_package(
     context["actor_package_dir"] = package_dir
     context["template_svgs_dir"] = package_svgs_dir(package_dir)
     context["template_assets_dir"] = package_assets_dir(package_dir)
+    svg_paths = extract_template_svgs(cached_template_path, package_svgs_dir(package_dir))
+    context["template_svg_count"] = len(svg_paths)
 
     write_package_context(package_dir, context)
     return package_dir, context, False
