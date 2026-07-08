@@ -29,6 +29,7 @@ from extract_presentation_template import extract_template_package
 from template_actor import (
     package_dir_for_template,
     package_exists,
+    package_has_svgs,
     stage_package_into_output,
 )
 from template_catalog import list_templates
@@ -216,9 +217,10 @@ def main():
             return
         print("Available templates:")
         for template in templates:
+            package_dir = package_dir_for_template(template.path)
             status = (
                 "cached"
-                if package_exists(package_dir_for_template(template.path))
+                if package_exists(package_dir) and package_has_svgs(package_dir)
                 else "not extracted"
             )
             print(f"- {template.name} [{status}] -> {template.path}")
