@@ -4,9 +4,6 @@ Script-based pipeline: template → request → draft (deepagents) → review �
 revise (deepagents) → render (SVG) → export (pptx). Everything reads/writes
 `output/` only. One script = one stage, each readable top to bottom.
 
-Note: your original folder sketch labeled the output dir `utils/`, but every
-script reference in the plan text said `output/`. I went with `output/`.
-Rename in each script's `--output-dir` default if you actually meant `utils/`.
 
 ## Setup
 
